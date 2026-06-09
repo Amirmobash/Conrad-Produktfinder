@@ -1,12 +1,4 @@
-# app.py - Conrad Produktfinder (Ultimative Version mit Webcam & Auto-Suche)
-# Autor: Optimiert
-# Datum: 2026-04-09
-# Version: 6.0
-# Beschreibung: Streamlit-Anwendung zum Extrahieren von Conrad Artikelnummern
-#              aus CSV/PDF/Webcam und automatischen Suchen der Produkte auf conrad.de.
-
 import asyncio
-import aiohttp
 import base64
 import hashlib
 import io
@@ -14,710 +6,978 @@ import os
 import re
 import tempfile
 import time
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote, urljoin
 
+import aiohttp
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 from PIL import Image
 
-# ------------------------------------------------------------------------------
-# Optionale Importe für OCR, PDF, Barcode
-# ------------------------------------------------------------------------------
 try:
     import pytesseract
-    OCR_SUPPORT = True
 except ImportError:
-    OCR_SUPPORT = False
+    pytesseract = None
 
 try:
     import pdf2image
-    PDF2IMAGE_SUPPORT = True
 except ImportError:
-    PDF2IMAGE_SUPPORT = False
+    pdf2image = None
 
 try:
     from pyzbar.pyzbar import decode
-    BARCODE_SUPPORT = True
 except ImportError:
-    BARCODE_SUPPORT = False
+    decode = None
 
 try:
     from PyPDF2 import PdfReader
-    PDF_TEXT_SUPPORT = True
 except ImportError:
-    PDF_TEXT_SUPPORT = False
+    PdfReader = None
 
-# ------------------------------------------------------------------------------
-# Konfiguration (Umgebungsvariablen)
-# ------------------------------------------------------------------------------
-DEFAULT_TESSERACT_PATH = os.getenv("TESSERACT_PATH", "C:\\Program Files\\Tesseract-OCR\\tesseract.exe")
-DEFAULT_TESSDATA_PATH = os.getenv("TESSDATA_PATH", "C:\\Program Files\\Tesseract-OCR\\tessdata")
-DEFAULT_POPPLER_PATH = os.getenv("POPPLER_PATH", "C:\\poppler\\poppler-23.11.0\\Library\\bin")
 
-DEFAULT_SEARCH_DELAY = float(os.getenv("SEARCH_DELAY", "0.5"))       # geringere Verzögerung für Automatik
-DEFAULT_MAX_RESULTS = int(os.getenv("MAX_RESULTS", "5"))
-DEFAULT_ENABLE_FALLBACK = os.getenv("ENABLE_FALLBACK", "true").lower() == "true"
-DEFAULT_SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "duckduckgo")
+@dataclass
+class SearchConfig:
+    tesseract_path: str
+    tessdata_path: str
+    poppler_path: str
+    ocr_language: str
+    ocr_dpi: int
+    search_delay: float
+    max_results: int
+    fallback_enabled: bool
+    search_provider: str
+    serper_api_key: Optional[str]
+    bing_api_key: Optional[str]
+    cache_ttl: int
 
-SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-BING_API_KEY = os.getenv("BING_API_KEY")
-CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 
-# ------------------------------------------------------------------------------
-# Zentrale UI-Texte (Deutsch)
-# ------------------------------------------------------------------------------
-UI_TEXTE = {
-    "title": "🔍 Conrad Produktfinder – Automatische Bestellhilfe",
-    "subtitle": "PDF, CSV oder Webcam – ich suche alle Artikel selbstständig bei Conrad",
-    "file_upload": "📂 Datei hochladen (CSV oder PDF)",
-    "csv_help": "Laden Sie eine CSV-Datei mit Artikelliste hoch",
-    "pdf_help": "PDF mit Conrad-Bestellung oder Warenkorb – ich extrahiere alle Nummern",
-    "preview_data": "📋 Extrahierte Artikel",
-    "column_mapping": "🔧 Spaltenzuordnung (nur bei CSV nötig)",
-    "map_columns": "Weisen Sie die Spalten zu:",
-    "quantity": "Menge",
-    "article_no": "Conrad Artikel-Nr.",
-    "description": "Beschreibung",
-    "search_all": "🚀 Alle Positionen suchen (automatisch)",
-    "choose_product": "✅ Produkt auswählen",
-    "open_new_tab": "🌐 In neuem Tab öffnen",
-    "product_title": "📦 Produkttitel",
-    "conrad_number": "🔢 Bestell-Nr.",
-    "price": "💰 Preis",
-    "no_results": "❌ Keine Ergebnisse gefunden",
-    "download_csv": "📥 Ergebnis CSV herunterladen",
-    "processing_pdf": "📄 PDF wird verarbeitet...",
-    "search_settings": "⚙️ Such-Einstellungen",
-    "search_delay": "⏱️ Verzögerung zwischen Suchanfragen (Sekunden)",
-    "max_results": "📊 Maximale Suchergebnisse pro Produkt",
-    "apply_mapping": "Übernehmen",
-    "items_found": "Artikel gefunden",
-    "final_selection": "🎯 Ausgewählte Produkte",
-    "selected_products_count": "Produkte zugeordnet",
-    "not_found": "Nicht gefunden",
-    "manual_entry": "✏️ Manuelle Eingabe",
-    "tesseract_path": "🖨️ Pfad zu Tesseract (tesseract.exe)",
-    "tessdata_path": "🗂️ Pfad zum tessdata-Ordner",
-    "poppler_path": "📄 Pfad zu Poppler",
-    "ocr_config": "📑 OCR-Konfiguration",
-    "searching": "🔍 Suche Conrad nach Artikelnr.",
-    "no_results_for": "Keine Treffer für Artikelnr.",
-    "web_search_fallback": "🌐 Websuche-Fallback",
-    "enable_fallback": "Fallback aktivieren",
-    "searching_web": "Keine Conrad-Treffer – starte Websuche...",
-    "serper_api_key": "🔑 Serper.dev API-Schlüssel",
-    "bing_api_key": "🔑 Bing Web Search API-Schlüssel",
-    "search_provider": "Anbieter für Fallback",
-    "duckduckgo_fallback": "DuckDuckGo (kostenlos)",
-    "serper_dev": "Serper.dev (Google)",
-    "bing_search": "Bing Search",
-    "cache_info": "💾 Cache gültig für {} Sekunden",
-    "status_complete": "Suche abgeschlossen.",
-    "source_conrad": "Conrad direkt",
-    "source_fallback": "Web-Fallback",
-    "source_api": "API",
-    "ocr_language": "OCR-Sprache(n)",
-    "ocr_dpi": "DPI für OCR",
+@dataclass
+class ProductResult:
+    url: str
+    title: str
+    article_number: str
+    price: Optional[str]
+    relevance: int
+    source: str
+
+
+TEXT = {
+    "title": "🔍 Conrad Produktfinder",
+    "subtitle": "CSV, PDF, manuelle Eingabe oder Webcam – Artikelnummern erkennen und passende Conrad-Produkte finden",
     "data_source": "📁 Datenquelle wählen",
-    "csv_option": "📄 CSV hochladen",
-    "pdf_option": "📑 PDF hochladen (automatisch)",
-    "manual_option": "✏️ Manuelle Eingabe",
-    "webcam_option": "📸 Webcam-Scanner (Barcode/OCR)",
-    "num_products_manual": "Anzahl Produkte",
-    "product": "Produkt",
-    "quantity_abbr": "Menge",
-    "article_no_abbr": "Art.-Nr.",
-    "description_abbr": "Beschreibung",
-    "invalid_article": "Ungültige Artikelnummer",
-    "take_over": "Übernehmen",
-    "search_progress": "Suche Position {}/{}",
-    "source_label": "Quelle",
-    "webcam_scan": "📸 Artikelnummer scannen",
-    "webcam_help": "Richten Sie die Kamera auf einen Barcode oder die gedruckte Nummer. Klicken Sie auf 'Foto aufnehmen'.",
-    "scan_button": "🔍 Scannen",
-    "scanned_article": "Gescannte Artikelnummer: {}",
-    "add_to_list": "➕ Zur Liste hinzufügen",
-    "auto_search_active": "✅ Automatische Suche nach dem Hochladen aktiviert",
-    "auto_search_done": "Automatische Suche abgeschlossen",
+    "csv": "📄 CSV",
+    "pdf": "📑 PDF",
+    "manual": "✏️ Manuell",
+    "webcam": "📸 Webcam",
+    "settings": "⚙️ Einstellungen",
+    "ocr_settings": "📑 OCR-Einstellungen",
+    "search_settings": "🔍 Sucheinstellungen",
+    "fallback_settings": "🌐 Web-Fallback",
+    "upload_file": "Datei hochladen",
+    "preview": "📋 Erkannte Artikel",
+    "mapping": "🔧 Spalten zuordnen",
+    "quantity": "Menge",
+    "article": "Artikel-Nr.",
+    "description": "Beschreibung",
+    "apply": "Übernehmen",
+    "results": "🎯 Suchergebnisse",
+    "final": "✅ Ausgewählte Produkte",
+    "download": "📥 Ergebnis als CSV herunterladen",
+    "not_found": "Nicht gefunden",
 }
 
-UI_TEXTE["cache_info"] = UI_TEXTE["cache_info"].format(CACHE_TTL)
 
-# ------------------------------------------------------------------------------
-# Session-State initialisieren
-# ------------------------------------------------------------------------------
-def init_session_state():
-    if 'extrahierte_elemente' not in st.session_state:
-        st.session_state.extrahierte_elemente = None
-    if 'such_ergebnisse' not in st.session_state:
-        st.session_state.such_ergebnisse = {}
-    if 'ausgewaehlte_produkte' not in st.session_state:
-        st.session_state.ausgewaehlte_produkte = {}
-    if 'spalten_zuordnung' not in st.session_state:
-        st.session_state.spalten_zuordnung = {}
-    if 'such_cache' not in st.session_state:
-        st.session_state.such_cache = {}
-    if 'cache_zeitstempel' not in st.session_state:
-        st.session_state.cache_zeitstempel = {}
-    if 'auto_search_triggered' not in st.session_state:
-        st.session_state.auto_search_triggered = False
+def optional_support() -> Dict[str, bool]:
+    return {
+        "ocr": pytesseract is not None,
+        "pdf_image": pdf2image is not None,
+        "barcode": decode is not None,
+        "pdf_text": PdfReader is not None,
+    }
 
-# ------------------------------------------------------------------------------
-# Artikelnummer bereinigen
-# ------------------------------------------------------------------------------
-def bereinige_artikelnummer(artikel_nr: str) -> Optional[str]:
-    if not artikel_nr or not isinstance(artikel_nr, str):
+
+def init_state() -> None:
+    defaults = {
+        "items": None,
+        "mapping": {},
+        "results": {},
+        "selected": {},
+        "cache": {},
+        "cache_time": {},
+        "auto_search_done": False,
+    }
+
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def clean_article_number(value: Any) -> Optional[str]:
+    if value is None:
         return None
-    bereinigt = re.sub(r'[^\d-]', '', artikel_nr)
-    if '-' in bereinigt:
-        bereinigt = bereinigt.split('-')[0]
-    bereinigt = re.sub(r'\s+', '', bereinigt)
-    if bereinigt.isdigit() and 5 <= len(bereinigt) <= 8:
-        return bereinigt
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    text = re.sub(r"[^\d-]", "", text)
+
+    if "-" in text:
+        text = text.split("-")[0]
+
+    text = re.sub(r"\s+", "", text)
+
+    if text.isdigit() and 5 <= len(text) <= 8:
+        return text
+
     return None
 
-# ------------------------------------------------------------------------------
-# OCR einrichten
-# ------------------------------------------------------------------------------
-def richte_ocr_ein(tesseract_pfad=None, tessdata_pfad=None) -> Tuple[bool, str]:
-    if not OCR_SUPPORT:
-        return False, "pytesseract nicht installiert."
-    try:
-        if tesseract_pfad and os.path.exists(tesseract_pfad):
-            pytesseract.pytesseract.tesseract_cmd = tesseract_pfad
-        else:
-            pytesseract.get_tesseract_version()
-        if tessdata_pfad and os.path.exists(tessdata_pfad):
-            os.environ['TESSDATA_PREFIX'] = tessdata_pfad
-        return True, "OCR bereit"
-    except Exception as e:
-        return False, str(e)
 
-# ------------------------------------------------------------------------------
-# Barcode-Erkennung aus Bild
-# ------------------------------------------------------------------------------
-def erkenne_barcode_im_bild(bild: Image.Image) -> Optional[str]:
-    if not BARCODE_SUPPORT:
-        return None
+def setup_ocr(config: SearchConfig) -> bool:
+    if pytesseract is None:
+        return False
+
     try:
-        codes = decode(bild)
-        for code in codes:
-            nummer = code.data.decode('utf-8').strip()
-            bereinigt = bereinige_artikelnummer(nummer)
-            if bereinigt:
-                return bereinigt
-        return None
-    except:
+        if config.tesseract_path and os.path.exists(config.tesseract_path):
+            pytesseract.pytesseract.tesseract_cmd = config.tesseract_path
+
+        if config.tessdata_path and os.path.exists(config.tessdata_path):
+            os.environ["TESSDATA_PREFIX"] = config.tessdata_path
+
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+
+def extract_barcode(image: Image.Image) -> Optional[str]:
+    if decode is None:
         return None
 
-# ------------------------------------------------------------------------------
-# OCR auf Bild (für Artikelnummern)
-# ------------------------------------------------------------------------------
-def erkenne_artikelnummer_mit_ocr(bild: Image.Image, konfig: Dict) -> Optional[str]:
-    if not OCR_SUPPORT:
-        return None
-    erfolg, _ = richte_ocr_ein(konfig.get('tesseract_pfad'), konfig.get('tessdata_pfad'))
-    if not erfolg:
-        return None
     try:
-        # Bild vorbereiten
-        bild = bild.convert('L')  # Graustufen
-        # Nur Ziffern und Bindestriche erwarten
-        config = '--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789-'
-        sprache = konfig.get('ocr_sprache', 'deu+eng')
-        text = pytesseract.image_to_string(bild, lang=sprache, config=config)
-        nummern = re.findall(r'\d{5,8}', text)
-        for num in nummern:
-            bereinigt = bereinige_artikelnummer(num)
-            if bereinigt:
-                return bereinigt
-        return None
-    except:
+        for code in decode(image):
+            value = code.data.decode("utf-8", errors="ignore").strip()
+            article_number = clean_article_number(value)
+
+            if article_number:
+                return article_number
+    except Exception:
         return None
 
-# ------------------------------------------------------------------------------
-# PDF zu DataFrame (wie bisher, aber automatisch)
-# ------------------------------------------------------------------------------
-def extrahiere_text_aus_pdf(pdf_bytes: bytes, konfig: Dict) -> str:
-    # Versuche direkten Text
-    if PDF_TEXT_SUPPORT:
+    return None
+
+
+def extract_article_with_ocr(image: Image.Image, config: SearchConfig) -> Optional[str]:
+    if pytesseract is None or not setup_ocr(config):
+        return None
+
+    try:
+        gray = image.convert("L")
+        options = "--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789-"
+        text = pytesseract.image_to_string(gray, lang=config.ocr_language, config=options)
+
+        for number in re.findall(r"\d{5,8}", text):
+            article_number = clean_article_number(number)
+
+            if article_number:
+                return article_number
+    except Exception:
+        return None
+
+    return None
+
+
+def extract_text_from_pdf(pdf_bytes: bytes, config: SearchConfig) -> str:
+    text_parts = []
+
+    if PdfReader is not None:
         try:
             reader = PdfReader(io.BytesIO(pdf_bytes))
-            text = ""
-            for seite in reader.pages:
-                text += seite.extract_text() or ""
-            if text.strip():
-                return text
-        except:
+
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+
+                if page_text.strip():
+                    text_parts.append(page_text)
+
+            if text_parts:
+                return "\n".join(text_parts)
+        except Exception:
             pass
-    # OCR-Fallback
-    if not PDF2IMAGE_SUPPORT:
-        return ""
-    erfolg, _ = richte_ocr_ein(konfig.get('tesseract_pfad'), konfig.get('tessdata_pfad'))
-    if not erfolg:
-        return ""
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-        tmp.write(pdf_bytes)
-        tmp_pfad = tmp.name
-    try:
-        poppler = konfig.get('poppler_pfad')
-        bilder = pdf2image.convert_from_path(tmp_pfad, dpi=konfig.get('ocr_dpi', 300),
-                                             poppler_path=poppler if poppler and os.path.exists(poppler) else None)
-        gesamter_text = ""
-        for img in bilder:
-            img = img.convert('L')
-            text = pytesseract.image_to_string(img, lang=konfig.get('ocr_sprache', 'deu+eng'))
-            gesamter_text += text + "\n"
-        return gesamter_text
-    finally:
-        os.unlink(tmp_pfad)
 
-def extrahiere_artikelnummern_aus_text(text: str) -> List[str]:
+    if pdf2image is None or pytesseract is None or not setup_ocr(config):
+        return ""
+
+    temp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+            temp_file.write(pdf_bytes)
+            temp_path = temp_file.name
+
+        poppler_path = config.poppler_path if config.poppler_path and os.path.exists(config.poppler_path) else None
+
+        pages = pdf2image.convert_from_path(
+            temp_path,
+            dpi=config.ocr_dpi,
+            poppler_path=poppler_path,
+        )
+
+        for page in pages:
+            image = page.convert("L")
+            text_parts.append(
+                pytesseract.image_to_string(image, lang=config.ocr_language)
+            )
+
+    except Exception:
+        return ""
+
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+    return "\n".join(text_parts)
+
+
+def extract_article_numbers(text: str) -> List[str]:
     if not text:
         return []
-    muster = [
-        r'bestell[.-]?nr\.?\s*:?\s*(\d{5,8})',
-        r'artikel[.-]?nr\.?\s*:?\s*(\d{5,8})',
-        r'conrad\s*art\.?\s*nr\.?\s*:?\s*(\d{5,8})',
-        r'(\d{5,8})'
+
+    patterns = [
+        r"bestell[.\-\s]*nr\.?\s*:?\s*(\d{5,8})",
+        r"artikel[.\-\s]*nr\.?\s*:?\s*(\d{5,8})",
+        r"conrad\s*art\.?\s*nr\.?\s*:?\s*(\d{5,8})",
+        r"\b(\d{5,8})\b",
     ]
-    gefunden = set()
-    for pattern in muster:
+
+    found = set()
+
+    for pattern in patterns:
         for match in re.finditer(pattern, text, re.IGNORECASE):
-            num = match.group(1)
-            bereinigt = bereinige_artikelnummer(num)
-            if bereinigt:
-                gefunden.add(bereinigt)
-    return list(gefunden)
+            article_number = clean_article_number(match.group(1))
 
-def pdf_zu_dataframe(pdf_bytes: bytes, konfig: Dict) -> Optional[pd.DataFrame]:
-    st.info(UI_TEXTE["processing_pdf"])
-    text = extrahiere_text_aus_pdf(pdf_bytes, konfig)
+            if article_number:
+                found.add(article_number)
+
+    return sorted(found)
+
+
+def pdf_to_dataframe(pdf_bytes: bytes, config: SearchConfig) -> Optional[pd.DataFrame]:
+    with st.spinner("PDF wird verarbeitet..."):
+        text = extract_text_from_pdf(pdf_bytes, config)
+
     if not text:
-        st.error("Konnte keinen Text aus PDF extrahieren.")
+        st.error("Aus der PDF konnte kein Text gelesen werden.")
         return None
-    artikel_nrn = extrahiere_artikelnummern_aus_text(text)
-    if not artikel_nrn:
-        st.warning("Keine Conrad-Artikelnummern gefunden.")
-        return None
-    daten = [{'Menge': 1, 'Artikel-Nr.': art, 'Beschreibung': ""} for art in artikel_nrn]
-    df = pd.DataFrame(daten)
-    st.success(f"✅ {len(df)} Artikelnummern extrahiert.")
-    return df
 
-# ------------------------------------------------------------------------------
-# Suchfunktionen (asynchron, unverändert)
-# ------------------------------------------------------------------------------
-async def hole_html(session, url, headers):
+    article_numbers = extract_article_numbers(text)
+
+    if not article_numbers:
+        st.warning("Keine gültigen Conrad-Artikelnummern gefunden.")
+        return None
+
+    data = [
+        {
+            "Menge": 1,
+            "Artikel-Nr.": number,
+            "Beschreibung": "",
+        }
+        for number in article_numbers
+    ]
+
+    st.success(f"{len(data)} Artikelnummern erkannt.")
+    return pd.DataFrame(data)
+
+
+async def fetch_html(session: aiohttp.ClientSession, url: str, headers: Optional[Dict[str, str]] = None) -> Optional[str]:
+    headers = headers or {"User-Agent": "Mozilla/5.0"}
+
     try:
-        async with session.get(url, headers=headers, timeout=15) as resp:
-            if resp.status == 200:
-                return await resp.text()
-    except:
+        async with session.get(url, headers=headers, timeout=15) as response:
+            if response.status == 200:
+                return await response.text()
+    except Exception:
         return None
 
-async def suche_conrad_async(artikel_nr, session):
-    such_url = f"https://www.conrad.de/de/search.html?search={artikel_nr}"
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    html = await hole_html(session, such_url, headers)
+    return None
+
+
+async def search_conrad(article_number: str, session: aiohttp.ClientSession) -> List[ProductResult]:
+    url = f"https://www.conrad.de/de/search.html?search={quote(article_number)}"
+    html = await fetch_html(session, url)
+
     if not html:
         return []
-    soup = BeautifulSoup(html, 'html.parser')
-    produkte = []
-    link_muster = re.compile(r'/de/p/[\w-]+-\d+\.html', re.I)
-    for a in soup.find_all('a', href=True):
-        if link_muster.search(a['href']):
-            url = urljoin('https://www.conrad.de', a['href'])
-            produkte.append({
-                'url': url,
-                'titel': a.get_text(strip=True) or "Produkt",
-                'artikel_nr': artikel_nr,
-                'preis': None,
-                'relevanz': 100,
-                'quelle': 'conrad_direkt'
-            })
-    return produkte
 
-async def suche_duckduckgo_async(artikel_nr, session):
-    query = f"site:conrad.de {artikel_nr} Bestell-Nr"
+    soup = BeautifulSoup(html, "html.parser")
+    pattern = re.compile(r"/de/p/[\w\-]+-\d+\.html", re.IGNORECASE)
+    products = []
+    seen = set()
+
+    for link in soup.find_all("a", href=True):
+        href = link["href"]
+
+        if not pattern.search(href):
+            continue
+
+        full_url = urljoin("https://www.conrad.de", href)
+
+        if full_url in seen:
+            continue
+
+        seen.add(full_url)
+
+        title = link.get_text(" ", strip=True) or "Conrad Produkt"
+
+        products.append(
+            ProductResult(
+                url=full_url,
+                title=title,
+                article_number=article_number,
+                price=None,
+                relevance=100,
+                source="conrad",
+            )
+        )
+
+    return products
+
+
+async def search_duckduckgo(article_number: str, session: aiohttp.ClientSession) -> List[ProductResult]:
+    query = f"site:conrad.de/de/p/ {article_number} Bestell-Nr"
     url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    html = await hole_html(session, url, headers)
+    html = await fetch_html(session, url)
+
     if not html:
         return []
-    soup = BeautifulSoup(html, 'html.parser')
-    produkte = []
-    for link in soup.find_all('a', href=True, class_='result__url'):
-        href = link.get('href', '')
-        if 'conrad.de/de/p/' in href:
-            voll_url = href if href.startswith('http') else f'https:{href}'
-            produkte.append({
-                'url': voll_url,
-                'titel': "Conrad Produkt (Web)",
-                'artikel_nr': artikel_nr,
-                'preis': None,
-                'relevanz': 90,
-                'quelle': 'web_fallback'
-            })
-    return produkte[:5]
 
-async def suche_serper_async(artikel_nr, api_key, session):
-    query = f"site:conrad.de {artikel_nr}"
+    soup = BeautifulSoup(html, "html.parser")
+    products = []
+    seen = set()
+
+    for link in soup.find_all("a", href=True):
+        href = link.get("href", "")
+
+        if "conrad.de/de/p/" not in href:
+            continue
+
+        full_url = href if href.startswith("http") else f"https:{href}"
+
+        if full_url in seen:
+            continue
+
+        seen.add(full_url)
+
+        title = link.get_text(" ", strip=True) or "Conrad Produkt"
+
+        products.append(
+            ProductResult(
+                url=full_url,
+                title=title,
+                article_number=article_number,
+                price=None,
+                relevance=85,
+                source="duckduckgo",
+            )
+        )
+
+    return products[:5]
+
+
+async def search_serper(article_number: str, api_key: str, session: aiohttp.ClientSession) -> List[ProductResult]:
     url = "https://google.serper.dev/search"
-    headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json'}
-    payload = {"q": query, "num": 5}
+    headers = {
+        "X-API-KEY": api_key,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "q": f"site:conrad.de/de/p/ {article_number}",
+        "num": 5,
+    }
+
     try:
-        async with session.post(url, headers=headers, json=payload, timeout=15) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                produkte = []
-                for res in data.get('organic', []):
-                    if 'conrad.de/de/p/' in res.get('link', ''):
-                        produkte.append({
-                            'url': res['link'],
-                            'titel': res.get('title', 'Conrad Produkt'),
-                            'artikel_nr': artikel_nr,
-                            'preis': None,
-                            'relevanz': 95,
-                            'quelle': 'serper_api'
-                        })
-                return produkte
-    except:
+        async with session.post(url, headers=headers, json=payload, timeout=15) as response:
+            if response.status != 200:
+                return []
+
+            data = await response.json()
+    except Exception:
         return []
 
-async def suche_bing_async(artikel_nr, api_key, session):
-    query = f"site:conrad.de {artikel_nr}"
+    products = []
+
+    for item in data.get("organic", []):
+        link = item.get("link", "")
+
+        if "conrad.de/de/p/" not in link:
+            continue
+
+        products.append(
+            ProductResult(
+                url=link,
+                title=item.get("title", "Conrad Produkt"),
+                article_number=article_number,
+                price=None,
+                relevance=95,
+                source="serper",
+            )
+        )
+
+    return products
+
+
+async def search_bing(article_number: str, api_key: str, session: aiohttp.ClientSession) -> List[ProductResult]:
     url = "https://api.bing.microsoft.com/v7.0/search"
-    headers = {'Ocp-Apim-Subscription-Key': api_key}
-    params = {'q': query, 'count': 5, 'responseFilter': 'Webpages'}
+    headers = {"Ocp-Apim-Subscription-Key": api_key}
+    params = {
+        "q": f"site:conrad.de/de/p/ {article_number}",
+        "count": 5,
+        "responseFilter": "Webpages",
+    }
+
     try:
-        async with session.get(url, headers=headers, params=params, timeout=15) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                produkte = []
-                for res in data.get('webPages', {}).get('value', []):
-                    if 'conrad.de/de/p/' in res.get('url', ''):
-                        produkte.append({
-                            'url': res['url'],
-                            'titel': res.get('name', 'Conrad Produkt'),
-                            'artikel_nr': artikel_nr,
-                            'preis': None,
-                            'relevanz': 95,
-                            'quelle': 'bing_api'
-                        })
-                return produkte
-    except:
+        async with session.get(url, headers=headers, params=params, timeout=15) as response:
+            if response.status != 200:
+                return []
+
+            data = await response.json()
+    except Exception:
         return []
 
-async def suche_web_fallback_async(artikel_nr, konfig, session):
-    anbieter = konfig.get('such_anbieter', 'duckduckgo')
-    if anbieter == 'serper' and konfig.get('serper_api_key'):
-        return await suche_serper_async(artikel_nr, konfig['serper_api_key'], session)
-    elif anbieter == 'bing' and konfig.get('bing_api_key'):
-        return await suche_bing_async(artikel_nr, konfig['bing_api_key'], session)
-    else:
-        return await suche_duckduckgo_async(artikel_nr, session)
+    products = []
 
-async def hole_produkt_details_async(produkt_url, ursp_artikel_nr, session):
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    html = await hole_html(session, produkt_url, headers)
+    for item in data.get("webPages", {}).get("value", []):
+        link = item.get("url", "")
+
+        if "conrad.de/de/p/" not in link:
+            continue
+
+        products.append(
+            ProductResult(
+                url=link,
+                title=item.get("name", "Conrad Produkt"),
+                article_number=article_number,
+                price=None,
+                relevance=95,
+                source="bing",
+            )
+        )
+
+    return products
+
+
+async def fallback_search(article_number: str, config: SearchConfig, session: aiohttp.ClientSession) -> List[ProductResult]:
+    if config.search_provider == "serper" and config.serper_api_key:
+        return await search_serper(article_number, config.serper_api_key, session)
+
+    if config.search_provider == "bing" and config.bing_api_key:
+        return await search_bing(article_number, config.bing_api_key, session)
+
+    return await search_duckduckgo(article_number, session)
+
+
+async def load_product_details(product: ProductResult, session: aiohttp.ClientSession) -> ProductResult:
+    html = await fetch_html(session, product.url)
+
     if not html:
-        return None
-    soup = BeautifulSoup(html, 'html.parser')
-    titel = soup.find('h1').get_text(strip=True) if soup.find('h1') else "Titel unbekannt"
-    seiten_text = soup.get_text()
-    match = re.search(r'Bestell-Nr\.\s*([A-Z0-9\-]+)', seiten_text, re.I)
-    artikel_nr = match.group(1) if match else ursp_artikel_nr
-    preis_elem = soup.select_one('.price__value, .product__price')
-    preis = preis_elem.get_text(strip=True) if preis_elem else None
-    return {
-        'url': produkt_url,
-        'titel': titel,
-        'artikel_nr': artikel_nr,
-        'preis': preis,
-        'relevanz': 100 if artikel_nr == ursp_artikel_nr else 50,
-        'quelle': 'produktseite'
-    }
+        return product
 
-async def suche_produkt_async(artikel_nr, konfig):
-    cache_key = hashlib.md5(artikel_nr.encode()).hexdigest()
-    if cache_key in st.session_state.such_cache and (time.time() - st.session_state.cache_zeitstempel.get(cache_key, 0)) < CACHE_TTL:
-        return st.session_state.such_cache[cache_key]
+    soup = BeautifulSoup(html, "html.parser")
+
+    title_tag = soup.find("h1")
+    title = title_tag.get_text(" ", strip=True) if title_tag else product.title
+
+    page_text = soup.get_text(" ", strip=True)
+    number_match = re.search(r"Bestell[\s\-]*Nr\.?\s*([A-Z0-9\-]+)", page_text, re.IGNORECASE)
+
+    article_number = number_match.group(1) if number_match else product.article_number
+
+    price_tag = soup.select_one(".price__value, .product__price, [data-test='product-price']")
+    price = price_tag.get_text(" ", strip=True) if price_tag else product.price
+
+    relevance = 100 if clean_article_number(article_number) == clean_article_number(product.article_number) else product.relevance
+
+    return ProductResult(
+        url=product.url,
+        title=title,
+        article_number=article_number,
+        price=price,
+        relevance=relevance,
+        source=product.source,
+    )
+
+
+async def search_product(article_number: str, config: SearchConfig) -> List[ProductResult]:
+    cache_key = hashlib.md5(article_number.encode("utf-8")).hexdigest()
+    cached = st.session_state.cache.get(cache_key)
+    cached_at = st.session_state.cache_time.get(cache_key, 0)
+
+    if cached and time.time() - cached_at < config.cache_ttl:
+        return cached
+
     async with aiohttp.ClientSession() as session:
-        produkte = await suche_conrad_async(artikel_nr, session)
-        if not produkte and konfig.get('fallback_aktiv', True):
-            st.toast(f"{UI_TEXTE['searching_web']} {artikel_nr}", icon="🌐")
-            fallback = await suche_web_fallback_async(artikel_nr, konfig, session)
-            produkte.extend(fallback)
-        max_res = konfig.get('max_ergebnisse', 5)
-        detail_produkte = []
-        for prod in produkte[:max_res]:
-            details = await hole_produkt_details_async(prod['url'], artikel_nr, session)
-            if details:
-                detail_produkte.append(details)
-            else:
-                detail_produkte.append(prod)
-        detail_produkte.sort(key=lambda x: x.get('relevanz', 0), reverse=True)
-        st.session_state.such_cache[cache_key] = detail_produkte
-        st.session_state.cache_zeitstempel[cache_key] = time.time()
-        return detail_produkte
+        products = await search_conrad(article_number, session)
 
-def suche_conrad_nach_artikelnummer(artikel_nr, konfig):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+        if not products and config.fallback_enabled:
+            products = await fallback_search(article_number, config, session)
+
+        detailed = []
+
+        for product in products[: config.max_results]:
+            detailed.append(await load_product_details(product, session))
+
+        detailed.sort(key=lambda item: item.relevance, reverse=True)
+
+    st.session_state.cache[cache_key] = detailed
+    st.session_state.cache_time[cache_key] = time.time()
+
+    return detailed
+
+
+def run_async_search(article_number: str, config: SearchConfig) -> List[ProductResult]:
     try:
-        return loop.run_until_complete(suche_produkt_async(artikel_nr, konfig))
-    finally:
-        loop.close()
+        return asyncio.run(search_product(article_number, config))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-# ------------------------------------------------------------------------------
-# Automatische Massensuche
-# ------------------------------------------------------------------------------
-def automatische_suche(df: pd.DataFrame, konfig: Dict, spalten_map: Dict):
-    """Führt sofort die Suche für alle Zeilen durch (ohne extra Button)."""
-    artikel_spalte = spalten_map.get('artikel_nr', 'Artikel-Nr.')
-    gesamt = len(df)
-    progress_bar = st.progress(0)
+        try:
+            return loop.run_until_complete(search_product(article_number, config))
+        finally:
+            loop.close()
+
+
+def automatic_search(dataframe: pd.DataFrame, config: SearchConfig, mapping: Dict[str, str]) -> None:
+    article_column = mapping.get("article", "Artikel-Nr.")
+    total = len(dataframe)
+
+    progress = st.progress(0)
     status = st.empty()
-    for idx, zeile in df.iterrows():
-        status.text(UI_TEXTE["search_progress"].format(idx+1, gesamt))
-        if artikel_spalte in zeile and pd.notna(zeile[artikel_spalte]):
-            artikel_nr = str(zeile[artikel_spalte]).strip()
-            bereinigt = bereinige_artikelnummer(artikel_nr)
-            if bereinigt:
-                ergebnisse = suche_conrad_nach_artikelnummer(bereinigt, konfig)
-                st.session_state.such_ergebnisse[idx] = ergebnisse
-            else:
-                st.session_state.such_ergebnisse[idx] = []
-        else:
-            st.session_state.such_ergebnisse[idx] = []
-        time.sleep(konfig.get('such_verzoegerung', 0.5))
-        progress_bar.progress((idx+1)/gesamt)
-    status.text(UI_TEXTE["status_complete"])
-    st.toast(UI_TEXTE["auto_search_done"], icon="✅")
-    st.session_state.auto_search_triggered = True
 
-# ------------------------------------------------------------------------------
-# UI: Sidebar
-# ------------------------------------------------------------------------------
-def sidebar_konfiguration() -> Dict:
-    st.sidebar.image("https://www.conrad.de/medias/logo.svg", width=200)
-    st.sidebar.title("⚙️ Einstellungen")
-    
-    st.sidebar.subheader(UI_TEXTE["ocr_config"])
-    tesseract_pfad = st.sidebar.text_input(UI_TEXTE["tesseract_path"], value=DEFAULT_TESSERACT_PATH)
-    tessdata_pfad = st.sidebar.text_input(UI_TEXTE["tessdata_path"], value=DEFAULT_TESSDATA_PATH)
-    poppler_pfad = st.sidebar.text_input(UI_TEXTE["poppler_path"], value=DEFAULT_POPPLER_PATH)
-    
-    ocr_sprache = "deu+eng"
+    for position, (index, row) in enumerate(dataframe.iterrows(), start=1):
+        status.text(f"Suche Position {position} von {total}")
+
+        article_number = clean_article_number(row.get(article_column))
+
+        if article_number:
+            st.session_state.results[index] = run_async_search(article_number, config)
+        else:
+            st.session_state.results[index] = []
+
+        progress.progress(position / total)
+
+        if config.search_delay > 0:
+            time.sleep(config.search_delay)
+
+    status.text("Suche abgeschlossen.")
+    st.session_state.auto_search_done = True
+
+
+def build_sidebar_config() -> SearchConfig:
+    support = optional_support()
+
+    st.sidebar.title(TEXT["settings"])
+
+    st.sidebar.subheader(TEXT["ocr_settings"])
+
+    tesseract_path = st.sidebar.text_input(
+        "Tesseract-Pfad",
+        value=os.getenv("TESSERACT_PATH", r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+    )
+
+    tessdata_path = st.sidebar.text_input(
+        "Tessdata-Pfad",
+        value=os.getenv("TESSDATA_PATH", r"C:\Program Files\Tesseract-OCR\tessdata"),
+    )
+
+    poppler_path = st.sidebar.text_input(
+        "Poppler-Pfad",
+        value=os.getenv("POPPLER_PATH", r"C:\poppler\Library\bin"),
+    )
+
+    ocr_language = "deu+eng"
     ocr_dpi = 300
-    if OCR_SUPPORT and PDF2IMAGE_SUPPORT:
-        ocr_sprache = st.sidebar.selectbox(UI_TEXTE["ocr_language"], ["deu+eng", "deu", "eng"])
-        ocr_dpi = st.sidebar.selectbox(UI_TEXTE["ocr_dpi"], [200,300,400], index=1)
-    
-    st.sidebar.subheader(UI_TEXTE["search_settings"])
-    such_verzoegerung = st.sidebar.number_input(UI_TEXTE["search_delay"], 0.0, 5.0, DEFAULT_SEARCH_DELAY, 0.5)
-    max_ergebnisse = st.sidebar.number_input(UI_TEXTE["max_results"], 1, 10, DEFAULT_MAX_RESULTS)
-    
-    st.sidebar.subheader(UI_TEXTE["web_search_fallback"])
-    fallback_aktiv = st.sidebar.checkbox(UI_TEXTE["enable_fallback"], DEFAULT_ENABLE_FALLBACK)
-    anbieter = st.sidebar.selectbox(UI_TEXTE["search_provider"], ["duckduckgo", "serper", "bing"],
-                                    format_func=lambda x: UI_TEXTE[f"{x}_fallback" if x!="bing" else "bing_search"])
-    api_key = None
-    if anbieter == "serper":
-        api_key = st.sidebar.text_input(UI_TEXTE["serper_api_key"], type="password", value=SERPER_API_KEY or "")
-    elif anbieter == "bing":
-        api_key = st.sidebar.text_input(UI_TEXTE["bing_api_key"], type="password", value=BING_API_KEY or "")
-    
-    st.sidebar.info(UI_TEXTE["cache_info"])
-    return {
-        'tesseract_pfad': tesseract_pfad, 'tessdata_pfad': tessdata_pfad, 'poppler_pfad': poppler_pfad,
-        'ocr_sprache': ocr_sprache, 'ocr_dpi': ocr_dpi, 'such_verzoegerung': such_verzoegerung,
-        'max_ergebnisse': max_ergebnisse, 'fallback_aktiv': fallback_aktiv,
-        'such_anbieter': anbieter, 'serper_api_key': api_key if anbieter=="serper" else None,
-        'bing_api_key': api_key if anbieter=="bing" else None,
+
+    if support["ocr"]:
+        ocr_language = st.sidebar.selectbox("OCR-Sprache", ["deu+eng", "deu", "eng"])
+
+    if support["pdf_image"]:
+        ocr_dpi = st.sidebar.selectbox("OCR-DPI", [200, 300, 400], index=1)
+
+    st.sidebar.subheader(TEXT["search_settings"])
+
+    search_delay = st.sidebar.number_input(
+        "Verzögerung zwischen Suchanfragen",
+        min_value=0.0,
+        max_value=5.0,
+        value=float(os.getenv("SEARCH_DELAY", "0.5")),
+        step=0.25,
+    )
+
+    max_results = st.sidebar.number_input(
+        "Maximale Ergebnisse pro Artikel",
+        min_value=1,
+        max_value=10,
+        value=int(os.getenv("MAX_RESULTS", "5")),
+    )
+
+    st.sidebar.subheader(TEXT["fallback_settings"])
+
+    fallback_enabled = st.sidebar.checkbox(
+        "Fallback-Suche aktivieren",
+        value=os.getenv("ENABLE_FALLBACK", "true").lower() == "true",
+    )
+
+    search_provider = st.sidebar.selectbox(
+        "Fallback-Anbieter",
+        ["duckduckgo", "serper", "bing"],
+    )
+
+    serper_key = None
+    bing_key = None
+
+    if search_provider == "serper":
+        serper_key = st.sidebar.text_input(
+            "Serper API Key",
+            value=os.getenv("SERPER_API_KEY", ""),
+            type="password",
+        )
+
+    if search_provider == "bing":
+        bing_key = st.sidebar.text_input(
+            "Bing API Key",
+            value=os.getenv("BING_API_KEY", ""),
+            type="password",
+        )
+
+    cache_ttl = int(os.getenv("CACHE_TTL", "3600"))
+    st.sidebar.info(f"Cache gültig für {cache_ttl} Sekunden.")
+
+    return SearchConfig(
+        tesseract_path=tesseract_path,
+        tessdata_path=tessdata_path,
+        poppler_path=poppler_path,
+        ocr_language=ocr_language,
+        ocr_dpi=ocr_dpi,
+        search_delay=search_delay,
+        max_results=max_results,
+        fallback_enabled=fallback_enabled,
+        search_provider=search_provider,
+        serper_api_key=serper_key,
+        bing_api_key=bing_key,
+        cache_ttl=cache_ttl,
+    )
+
+
+def show_csv_input() -> None:
+    uploaded = st.file_uploader(TEXT["upload_file"], type=["csv"])
+
+    if not uploaded:
+        return
+
+    try:
+        dataframe = pd.read_csv(uploaded)
+    except Exception as error:
+        st.error(f"CSV konnte nicht gelesen werden: {error}")
+        return
+
+    st.session_state.items = dataframe
+    st.session_state.results = {}
+    st.session_state.selected = {}
+    st.session_state.auto_search_done = False
+
+
+def show_pdf_input(config: SearchConfig) -> None:
+    uploaded = st.file_uploader(TEXT["upload_file"], type=["pdf"])
+
+    if not uploaded:
+        return
+
+    dataframe = pdf_to_dataframe(uploaded.getvalue(), config)
+
+    if dataframe is not None:
+        st.session_state.items = dataframe
+        st.session_state.mapping = {
+            "quantity": "Menge",
+            "article": "Artikel-Nr.",
+            "description": "Beschreibung",
+        }
+        st.session_state.results = {}
+        st.session_state.selected = {}
+        st.session_state.auto_search_done = False
+
+
+def show_manual_input() -> None:
+    count = st.number_input("Anzahl Produkte", min_value=1, max_value=50, value=3)
+    rows = []
+
+    for index in range(count):
+        with st.expander(f"Produkt {index + 1}", expanded=index == 0):
+            col1, col2, col3 = st.columns([1, 2, 3])
+
+            quantity = col1.number_input("Menge", min_value=1, max_value=999, value=1, key=f"qty_{index}")
+            article = col2.text_input("Artikel-Nr.", key=f"art_{index}")
+            description = col3.text_input("Beschreibung", key=f"desc_{index}")
+
+            article_number = clean_article_number(article)
+
+            if article and not article_number:
+                st.warning("Ungültige Artikelnummer.")
+
+            if article_number:
+                rows.append(
+                    {
+                        "Menge": quantity,
+                        "Artikel-Nr.": article_number,
+                        "Beschreibung": description,
+                    }
+                )
+
+    if rows and st.button("Liste übernehmen"):
+        st.session_state.items = pd.DataFrame(rows)
+        st.session_state.mapping = {
+            "quantity": "Menge",
+            "article": "Artikel-Nr.",
+            "description": "Beschreibung",
+        }
+        st.session_state.results = {}
+        st.session_state.selected = {}
+        st.session_state.auto_search_done = False
+        st.rerun()
+
+
+def show_webcam_input(config: SearchConfig) -> None:
+    image_file = st.camera_input("Artikelnummer oder Barcode scannen")
+
+    if not image_file:
+        return
+
+    image = Image.open(image_file)
+
+    article_number = extract_barcode(image)
+
+    if not article_number:
+        article_number = extract_article_with_ocr(image, config)
+
+    if not article_number:
+        st.warning("Keine gültige Conrad-Artikelnummer erkannt.")
+        return
+
+    st.success(f"Erkannte Artikelnummer: {article_number}")
+
+    if st.button("Zur Liste hinzufügen"):
+        new_row = pd.DataFrame(
+            [
+                {
+                    "Menge": 1,
+                    "Artikel-Nr.": article_number,
+                    "Beschreibung": "",
+                }
+            ]
+        )
+
+        if st.session_state.items is None:
+            st.session_state.items = new_row
+        else:
+            st.session_state.items = pd.concat([st.session_state.items, new_row], ignore_index=True)
+
+        st.session_state.mapping = {
+            "quantity": "Menge",
+            "article": "Artikel-Nr.",
+            "description": "Beschreibung",
+        }
+        st.session_state.auto_search_done = False
+        st.rerun()
+
+
+def show_mapping(dataframe: pd.DataFrame, source: str) -> None:
+    if source != TEXT["csv"]:
+        st.session_state.mapping = {
+            "quantity": "Menge",
+            "article": "Artikel-Nr.",
+            "description": "Beschreibung",
+        }
+        st.info("Die Spalten sind bereits passend zugeordnet.")
+        return
+
+    st.subheader(TEXT["mapping"])
+
+    columns = [""] + list(dataframe.columns)
+    col1, col2, col3 = st.columns(3)
+
+    quantity = col1.selectbox(TEXT["quantity"], columns)
+    article = col2.selectbox(TEXT["article"], columns)
+    description = col3.selectbox(TEXT["description"], columns)
+
+    if st.button(TEXT["apply"]):
+        if not article:
+            st.warning("Bitte eine Spalte für die Artikelnummer auswählen.")
+            return
+
+        st.session_state.mapping = {
+            "quantity": quantity or "Menge",
+            "article": article,
+            "description": description or "Beschreibung",
+        }
+        st.session_state.auto_search_done = False
+        st.success("Spaltenzuordnung gespeichert.")
+
+
+def source_label(source: str) -> str:
+    labels = {
+        "conrad": "Conrad direkt",
+        "duckduckgo": "Web-Fallback",
+        "serper": "Serper API",
+        "bing": "Bing API",
     }
 
-# ------------------------------------------------------------------------------
-# UI: Ergebnisse anzeigen
-# ------------------------------------------------------------------------------
-def zeige_suchergebnisse(idx: int, konfig: Dict):
-    ergebnisse = st.session_state.such_ergebnisse.get(idx, [])
-    if not ergebnisse:
-        st.write(UI_TEXTE["no_results"])
+    return labels.get(source, source)
+
+
+def show_results_for_row(index: int, row: pd.Series, mapping: Dict[str, str]) -> None:
+    results = st.session_state.results.get(index, [])
+
+    if not results:
+        st.write(TEXT["not_found"])
         return
-    optionen = []
-    for res in ergebnisse:
-        quelle = res.get('quelle', '')
-        quelle_txt = ""
-        if quelle == 'conrad_direkt': quelle_txt = f" [{UI_TEXTE['source_conrad']}]"
-        elif quelle == 'web_fallback': quelle_txt = f" [{UI_TEXTE['source_fallback']}]"
-        elif quelle in ('serper_api','bing_api'): quelle_txt = f" [{UI_TEXTE['source_api']}]"
-        optionen.append(f"{res['titel']} | {res['artikel_nr']} | {res['preis'] or '?'}{quelle_txt}")
-    auswahl = st.radio(f"{UI_TEXTE['choose_product']} #{idx+1}:", range(len(optionen)), format_func=lambda i: optionen[i], key=f"ausw_{idx}")
-    if auswahl is not None:
-        ausgew = ergebnisse[auswahl]
-        st.session_state.ausgewaehlte_produkte[idx] = ausgew
-        col1, col2 = st.columns([3,1])
-        col1.write(f"**{UI_TEXTE['product_title']}:** {ausgew['titel']}")
-        col1.write(f"**{UI_TEXTE['conrad_number']}:** {ausgew['artikel_nr']}")
-        col1.write(f"**{UI_TEXTE['price']}:** {ausgew['preis'] or 'N/A'}")
-        col2.markdown(f'<a href="{ausgew["url"]}" target="_blank"><button>{UI_TEXTE["open_new_tab"]}</button></a>', unsafe_allow_html=True)
 
-def erstelle_endgueltigen_dataframe(original_df: pd.DataFrame, spalten_map: Dict) -> pd.DataFrame:
-    enddaten = []
-    for idx, zeile in original_df.iterrows():
-        zeile_dict = zeile.to_dict()
-        if idx in st.session_state.ausgewaehlte_produkte:
-            sel = st.session_state.ausgewaehlte_produkte[idx]
-            zeile_dict['Conrad URL'] = sel['url']
-            zeile_dict['Bestell-Nr. (Conrad)'] = sel['artikel_nr']
-            zeile_dict['Titel'] = sel['titel']
-            zeile_dict['Preis'] = sel['preis'] or ''
-            zeile_dict['Status'] = 'Gefunden'
-        else:
-            zeile_dict['Conrad URL'] = ''
-            zeile_dict['Bestell-Nr. (Conrad)'] = ''
-            zeile_dict['Titel'] = ''
-            zeile_dict['Preis'] = ''
-            zeile_dict['Status'] = UI_TEXTE['not_found']
-        enddaten.append(zeile_dict)
-    return pd.DataFrame(enddaten)
+    options = []
 
-# ------------------------------------------------------------------------------
-# Hauptprogramm
-# ------------------------------------------------------------------------------
-def main():
-    st.set_page_config(page_title="Conrad Produktfinder", page_icon="🔍", layout="wide")
-    st.title(UI_TEXTE["title"])
-    st.markdown(f"### {UI_TEXTE['subtitle']}")
-    init_session_state()
-    konfig = sidebar_konfiguration()
-    
-    datenquellen = [UI_TEXTE["csv_option"], UI_TEXTE["manual_option"]]
-    if OCR_SUPPORT and PDF2IMAGE_SUPPORT:
-        datenquellen.append(UI_TEXTE["pdf_option"])
-    if BARCODE_SUPPORT or OCR_SUPPORT:
-        datenquellen.append(UI_TEXTE["webcam_option"])
-    quelle = st.radio(UI_TEXTE["data_source"], datenquellen, horizontal=True)
-    
-    # -------------------- CSV --------------------
-    if quelle == UI_TEXTE["csv_option"]:
-        uploaded = st.file_uploader(UI_TEXTE["file_upload"], type=['csv'], help=UI_TEXTE['csv_help'])
-        if uploaded:
-            df = pd.read_csv(uploaded)
-            st.session_state.extrahierte_elemente = df
-            st.session_state.auto_search_triggered = False
-    
-    # -------------------- PDF --------------------
-    elif quelle == UI_TEXTE["pdf_option"]:
-        uploaded = st.file_uploader(UI_TEXTE["file_upload"], type=['pdf'], help=UI_TEXTE['pdf_help'])
-        if uploaded:
-            df = pdf_zu_dataframe(uploaded.getvalue(), konfig)
-            if df is not None:
-                st.session_state.extrahierte_elemente = df
-                st.session_state.auto_search_triggered = False
-    
-    # -------------------- Manuell --------------------
-    elif quelle == UI_TEXTE["manual_option"]:
-        st.subheader(UI_TEXTE["manual_entry"])
-        anzahl = st.number_input(UI_TEXTE["num_products_manual"], 1, 50, 3)
-        produkte = []
-        for i in range(anzahl):
-            with st.expander(f"{UI_TEXTE['product']} {i+1}"):
-                col1, col2 = st.columns(2)
-                menge = col1.number_input(f"{UI_TEXTE['quantity_abbr']} {i+1}", 1, 999, 1, key=f"menge_{i}")
-                art = col1.text_input(f"{UI_TEXTE['article_no_abbr']} {i+1}", key=f"art_{i}")
-                beschr = col2.text_input(f"{UI_TEXTE['description_abbr']} {i+1}", key=f"beschr_{i}")
-                if art:
-                    bereinigt = bereinige_artikelnummer(art)
-                    if bereinigt:
-                        produkte.append({'Menge': menge, 'Artikel-Nr.': bereinigt, 'Beschreibung': beschr})
-        if produkte and st.button(UI_TEXTE["take_over"]):
-            st.session_state.extrahierte_elemente = pd.DataFrame(produkte)
-            st.session_state.auto_search_triggered = False
-    
-    # -------------------- Webcam-Scanner --------------------
-    elif quelle == UI_TEXTE["webcam_option"]:
-        st.subheader(UI_TEXTE["webcam_scan"])
-        st.markdown(UI_TEXTE["webcam_help"])
-        bild = st.camera_input("📸 Kamera")
-        if bild:
-            img = Image.open(bild)
-            # Zuerst Barcode versuchen
-            artikel_nr = erkenne_barcode_im_bild(img)
-            if not artikel_nr:
-                artikel_nr = erkenne_artikelnummer_mit_ocr(img, konfig)
-            if artikel_nr:
-                st.success(UI_TEXTE["scanned_article"].format(artikel_nr))
-                if st.button(UI_TEXTE["add_to_list"]):
-                    # Neue Zeile zur aktuellen Liste hinzufügen
-                    neue_zeile = pd.DataFrame([{'Menge': 1, 'Artikel-Nr.': artikel_nr, 'Beschreibung': ''}])
-                    if st.session_state.extrahierte_elemente is None:
-                        st.session_state.extrahierte_elemente = neue_zeile
-                    else:
-                        st.session_state.extrahierte_elemente = pd.concat([st.session_state.extrahierte_elemente, neue_zeile], ignore_index=True)
-                    st.session_state.auto_search_triggered = False
-                    st.rerun()
-            else:
-                st.warning("Keine gültige Conrad-Artikelnummer erkannt.")
-    
-    # -------------------- Verarbeitung der extrahierten Daten --------------------
-    if st.session_state.extrahierte_elemente is not None:
-        df = st.session_state.extrahierte_elemente
-        st.subheader(UI_TEXTE["preview_data"])
-        st.dataframe(df, use_container_width=True)
-        
-        # Spaltenzuordnung (nur bei CSV sinnvoll, bei PDF/manuell sind die Spalten standardisiert)
-        if quelle == UI_TEXTE["csv_option"]:
-            st.subheader(UI_TEXTE["column_mapping"])
-            col1, col2, col3 = st.columns(3)
-            menge_map = col1.selectbox(UI_TEXTE["quantity"], [''] + list(df.columns), key="menge_map_csv")
-            artikel_map = col2.selectbox(UI_TEXTE["article_no"], [''] + list(df.columns), key="artikel_map_csv")
-            beschr_map = col3.selectbox(UI_TEXTE["description"], [''] + list(df.columns), key="beschr_map_csv")
-            spalten_zuordnung = {
-                'menge': menge_map if menge_map else 'Menge',
-                'artikel_nr': artikel_map if artikel_map else 'Artikel-Nr.',
-                'beschreibung': beschr_map if beschr_map else 'Beschreibung'
-            }
-            if st.button(UI_TEXTE["apply_mapping"]):
-                st.session_state.spalten_zuordnung = spalten_zuordnung
-                st.success("Zuordnung übernommen")
+    for result in results:
+        options.append(
+            f"{result.title} | {result.article_number} | {result.price or 'N/A'} | {source_label(result.source)}"
+        )
+
+    selected_index = st.radio(
+        "Produkt auswählen",
+        range(len(options)),
+        format_func=lambda value: options[value],
+        key=f"select_{index}",
+    )
+
+    selected = results[selected_index]
+    st.session_state.selected[index] = selected
+
+    col1, col2 = st.columns([3, 1])
+
+    col1.write(f"**Titel:** {selected.title}")
+    col1.write(f"**Bestell-Nr.:** {selected.article_number}")
+    col1.write(f"**Preis:** {selected.price or 'N/A'}")
+    col1.write(f"**Quelle:** {source_label(selected.source)}")
+
+    col2.link_button("Öffnen", selected.url)
+
+
+def final_dataframe(dataframe: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+
+    for index, row in dataframe.iterrows():
+        data = row.to_dict()
+        selected = st.session_state.selected.get(index)
+
+        if selected:
+            data["Conrad URL"] = selected.url
+            data["Bestell-Nr. Conrad"] = selected.article_number
+            data["Titel Conrad"] = selected.title
+            data["Preis Conrad"] = selected.price or ""
+            data["Status"] = "Gefunden"
         else:
-            # Bei PDF/Manuell/Webcam sind die Spalten bereits korrekt
-            st.session_state.spalten_zuordnung = {
-                'menge': 'Menge',
-                'artikel_nr': 'Artikel-Nr.',
-                'beschreibung': 'Beschreibung'
-            }
-            st.info("Spalten sind bereits korrekt zugeordnet.")
-        
-        # Automatische Suche starten (einmalig nach dem Laden/Zuordnung)
-        if st.session_state.spalten_zuordnung and not st.session_state.auto_search_triggered:
-            with st.spinner("🔍 Automatische Suche läuft für alle Artikel..."):
-                automatische_suche(df, konfig, st.session_state.spalten_zuordnung)
-        
-        # Ergebnisse anzeigen
-        if st.session_state.such_ergebnisse:
-            for idx, zeile in df.iterrows():
-                artikel_nr = zeile.get(st.session_state.spalten_zuordnung.get('artikel_nr', 'Artikel-Nr.'), '?')
-                with st.expander(f"Position {idx+1}: Artikelnr. {artikel_nr}"):
-                    st.write(f"**Menge:** {zeile.get(st.session_state.spalten_zuordnung.get('menge', 'Menge'), '1')}")
-                    if idx in st.session_state.such_ergebnisse:
-                        zeige_suchergebnisse(idx, konfig)
-                    else:
-                        st.info("Suche läuft oder noch nicht gestartet.")
-        
-        # Finale Auswahl und Download
-        if st.session_state.ausgewaehlte_produkte:
-            st.subheader(UI_TEXTE["final_selection"])
-            final_df = erstelle_endgueltigen_dataframe(df, st.session_state.spalten_zuordnung)
-            st.dataframe(final_df, use_container_width=True)
-            csv = final_df.to_csv(index=False, encoding='utf-8-sig')
-            b64 = base64.b64encode(csv.encode('utf-8-sig')).decode()
-            st.markdown(f'<a href="data:file/csv;base64,{b64}" download="conrad_ergebnisse.csv">{UI_TEXTE["download_csv"]}</a>', unsafe_allow_html=True)
+            data["Conrad URL"] = ""
+            data["Bestell-Nr. Conrad"] = ""
+            data["Titel Conrad"] = ""
+            data["Preis Conrad"] = ""
+            data["Status"] = TEXT["not_found"]
+
+        rows.append(data)
+
+    return pd.DataFrame(rows)
+
+
+def download_dataframe(dataframe: pd.DataFrame) -> None:
+    csv = dataframe.to_csv(index=False, encoding="utf-8-sig")
+    encoded = base64.b64encode(csv.encode("utf-8-sig")).decode("utf-8")
+
+    st.markdown(
+        f'<a href="data:file/csv;base64,{encoded}" download="conrad_ergebnisse.csv">{TEXT["download"]}</a>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_items(config: SearchConfig, source: str) -> None:
+    dataframe = st.session_state.items
+
+    if dataframe is None:
+        return
+
+    st.subheader(TEXT["preview"])
+    st.dataframe(dataframe, use_container_width=True)
+
+    show_mapping(dataframe, source)
+
+    if st.session_state.mapping and not st.session_state.auto_search_done:
+        with st.spinner("Automatische Suche läuft..."):
+            automatic_search(dataframe, config, st.session_state.mapping)
+
+    if st.session_state.results:
+        st.subheader(TEXT["results"])
+
+        for index, row in dataframe.iterrows():
+            article_column = st.session_state.mapping.get("article", "Artikel-Nr.")
+            article_number = row.get(article_column, "?")
+
+            with st.expander(f"Position {index + 1}: {article_number}"):
+                show_results_for_row(index, row, st.session_state.mapping)
+
+    if st.session_state.selected:
+        st.subheader(TEXT["final"])
+        output = final_dataframe(dataframe)
+        st.dataframe(output, use_container_width=True)
+        download_dataframe(output)
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Conrad Produktfinder",
+        page_icon="🔍",
+        layout="wide",
+    )
+
+    init_state()
+
+    st.title(TEXT["title"])
+    st.markdown(f"### {TEXT['subtitle']}")
+
+    config = build_sidebar_config()
+    support = optional_support()
+
+    sources = [TEXT["csv"], TEXT["manual"]]
+
+    if support["pdf_text"] or support["pdf_image"]:
+        sources.append(TEXT["pdf"])
+
+    if support["barcode"] or support["ocr"]:
+        sources.append(TEXT["webcam"])
+
+    source = st.radio(TEXT["data_source"], sources, horizontal=True)
+
+    if source == TEXT["csv"]:
+        show_csv_input()
+
+    elif source == TEXT["pdf"]:
+        show_pdf_input(config)
+
+    elif source == TEXT["manual"]:
+        show_manual_input()
+
+    elif source == TEXT["webcam"]:
+        show_webcam_input(config)
+
+    render_items(config, source)
+
 
 if __name__ == "__main__":
     main()
+```
