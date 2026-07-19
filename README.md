@@ -348,6 +348,8 @@ Contributions are welcome! Ideas for improvement:
 
 Please open an issue or submit a pull request on the [GitHub repository](https://github.com/<your-username>/conrad-product-finder).
 
+https://www.linkedin.com/posts/amirmobasher_python-opencv-computervision-activity-7464584127930036225-ueH2?utm_source=share&utm_medium=member_desktop&rcm=ACoAAA7tqwMBdIETigYQYzFJUPJd118UwwaoL_k
+
 ---
 
 ## License
