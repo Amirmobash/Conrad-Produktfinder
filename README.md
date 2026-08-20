@@ -1,4 +1,4 @@
-# Conrad Product Finder 🔍
+# Conrad Product Finder
 
 A **Streamlit** web application that helps you **reconstruct Conrad orders** by extracting Conrad article numbers from CSV or PDF documents and matching them to current product pages on [conrad.de](https://www.conrad.de). It supports OCR for scanned PDFs and can optionally fall back to web search if the Conrad search returns no results.
 
