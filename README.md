@@ -1,5 +1,11 @@
 # Conrad Produktfinder
 
+
+<p align="center"><img src="docs/images/conrad-csv-pdf-product-finder-software.svg" alt="Conrad product matching software for CSV PDF and catalog part numbers" width="960" /></p>
+
+<sub>Illustrative project schematic; not an actual CAD export, hardware photograph, or independently tested result.</sub>
+
+
 Ein sauber strukturierter Produktfinder für Conrad-Bestellungen mit CSV-, PDF-, manueller und Kamera-Eingabe.
 
 **Entwickelt von Amir Mobasheraghdam**
